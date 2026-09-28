@@ -42,10 +42,15 @@ class FlickerCore:
         if len(waveform) == 0:
             return 0.0, 0.0
         
-        v_max = float(np.max(waveform))
-        v_min = float(np.min(waveform))
+        if len(waveform) > 200:
+            # 使用 99.8% 与 0.2% 分位数排除残留孤立毛刺脉冲引起的极值剧烈震荡
+            v_max = float(np.percentile(waveform, 99.8))
+            v_min = float(np.percentile(waveform, 0.2))
+        else:
+            v_max = float(np.max(waveform))
+            v_min = float(np.min(waveform))
+
         v_sum = float(v_max + v_min)
-        
         percent = (100.0 * (v_max - v_min) / v_sum) if v_sum > 1e-9 else 0.0
         
         v_mean = float(np.mean(waveform))

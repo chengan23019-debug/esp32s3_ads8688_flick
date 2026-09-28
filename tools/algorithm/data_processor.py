@@ -7,6 +7,7 @@ and downstream analytics (oscilloscope view, flicker analysis, etc.).
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional
 import numpy as np
+from scipy import signal
 
 
 class BaseProcessingRule(ABC):
@@ -22,11 +23,15 @@ class BaseProcessingRule(ABC):
     def process(self, data: np.ndarray, fs: float, context: Optional[Dict[str, Any]] = None) -> np.ndarray:
         """
         Process the input 1D numpy array of samples.
-        :param data: 1D float/int numpy array of sampled voltages or raw codes.
+        :param data: 1D float numpy array of sampled voltages or raw codes.
         :param fs: Sampling frequency in Hz (e.g. 220000.0).
-        :param context: Optional extra parameters (e.g. channel info, calibration constants).
+        :param context: Optional extra parameters.
         :return: Processed 1D numpy array.
         """
+        pass
+
+    def reset(self):
+        """Reset internal filter states when stream breaks or resets."""
         pass
 
 
@@ -54,19 +59,157 @@ class ZeroClipRule(BaseProcessingRule):
         return np.clip(data, self.min_value, None)
 
 
+class SpikeGlitchRemovalRule(BaseProcessingRule):
+    """
+    针对硬件毛刺/异常窄脉冲尖峰的剔除滤波规则 (Anti-Glitch / Spike Filter)。
+    利用局部滑动中值差分检测瞬间跳变的窄脉冲毛刺并用平滑值替换，
+    特别有效滤除 USB 传输包边界干扰、电源地弹跳或 ADC 突发瞬态尖峰，
+    同时完好保留正弦波/三角波主频信号的原始波峰波谷形态。
+    """
+    def __init__(
+        self,
+        name: str = "SpikeGlitchFilter",
+        enabled: bool = True,
+        threshold_volts: float = 0.15,
+        window_size: int = 5
+    ):
+        super().__init__(name, enabled)
+        self.threshold = threshold_volts
+        self.window_size = window_size
+        self._history = np.array([], dtype=np.float32)
+
+    def reset(self):
+        self._history = np.array([], dtype=np.float32)
+
+    def process(self, data: np.ndarray, fs: float, context: Optional[Dict[str, Any]] = None) -> np.ndarray:
+        if not self.enabled or len(data) < 7:
+            return data
+
+        out = data.copy()
+        n = len(out)
+        w = max(5, self.window_size | 1)  # 保持奇数窗口
+        half_w = w // 2
+
+        # 拼接历史尾部数据保证分块边界平滑
+        if len(self._history) >= half_w:
+            concat_data = np.concatenate((self._history[-half_w:], out))
+            start_offset = half_w
+        else:
+            concat_data = out
+            start_offset = 0
+
+        # 保留最后几个点供下一批次拼接使用
+        self._history = out[-half_w:].copy()
+
+        d = concat_data
+        total_len = len(d)
+
+        # 针对毛刺的局部统计滤波：
+        # 1. 检测快速单点/双点下冲突变（下冲尖刺是图示的主要问题）
+        for i in range(max(1, start_offset), total_len - 1):
+            prev_val = d[i - 1]
+            cur_val = d[i]
+            next_val = d[i + 1]
+
+            local_baseline = 0.5 * (prev_val + next_val)
+            delta = cur_val - local_baseline
+
+            # 强下冲毛刺检测 (cur_val 明显低于局部均值)
+            if delta < -self.threshold:
+                # 左右两点相对连续，属于孤立下冲尖刺
+                if abs(next_val - prev_val) < abs(delta) * 0.75:
+                    d[i] = local_baseline
+
+            # 强上冲毛刺检测 (cur_val 明显高于局部均值)
+            elif delta > self.threshold:
+                if abs(next_val - prev_val) < abs(delta) * 0.75:
+                    d[i] = local_baseline
+
+        return concat_data[start_offset : start_offset + n]
+
+
+class IIRLowPassFilterRule(BaseProcessingRule):
+    """
+    高频噪声平滑低通滤波规则 (Butterworth Low-pass Filter)。
+    保持连续流式 IIR 状态（lfilter_zi），在分包连续流处理中无接缝突变。
+    截止频率默认 20 kHz，用于滤除 ADS8688 高采样率 (220 kSPS) 下引入的超宽带高频底噪。
+    """
+    def __init__(
+        self,
+        name: str = "LowPassFilter",
+        enabled: bool = False,
+        cutoff_hz: float = 20000.0,
+        order: int = 2
+    ):
+        super().__init__(name, enabled)
+        self.cutoff_hz = cutoff_hz
+        self.order = order
+        self._b = None
+        self._a = None
+        self._zi = None
+        self._last_fs = None
+
+    def reset(self):
+        self._zi = None
+
+    def _update_coefficients(self, fs: float):
+        nyq = 0.5 * fs
+        normal_cutoff = min(0.95, max(0.001, self.cutoff_hz / nyq))
+        self._b, self._a = signal.butter(self.order, normal_cutoff, btype='low', analog=False)
+        self._zi = signal.lfilter_zi(self._b, self._a)
+        self._last_fs = fs
+
+    def process(self, data: np.ndarray, fs: float, context: Optional[Dict[str, Any]] = None) -> np.ndarray:
+        if not self.enabled or len(data) == 0:
+            return data
+
+        if self._b is None or self._last_fs != fs:
+            self._update_coefficients(fs)
+
+        if self._zi is None:
+            self._zi = signal.lfilter_zi(self._b, self._a) * data[0]
+
+        filtered, self._zi = signal.lfilter(self._b, self._a, data, zi=self._zi)
+        return filtered.astype(np.float32)
+
+
+class MovingAverageFilterRule(BaseProcessingRule):
+    """
+    快速滑动均值滤波规则 (Moving Average Filter)。
+    简单稳健，用于去除细小高频毛刺，使示波器波形更平滑纯净。
+    """
+    def __init__(self, name: str = "MovingAverage", enabled: bool = False, window_size: int = 5):
+        super().__init__(name, enabled)
+        self.window_size = window_size
+        self._buf = np.array([], dtype=np.float32)
+
+    def reset(self):
+        self._buf = np.array([], dtype=np.float32)
+
+    def process(self, data: np.ndarray, fs: float, context: Optional[Dict[str, Any]] = None) -> np.ndarray:
+        if not self.enabled or len(data) < self.window_size:
+            return data
+
+        w = max(3, int(self.window_size))
+        # 拼接前序缓冲以消除分块滤波边界效应
+        if len(self._buf) > 0:
+            full = np.concatenate((self._buf, data))
+        else:
+            full = data
+
+        self._buf = full[-w:].copy()
+
+        kernel = np.ones(w, dtype=np.float32) / w
+        filtered = np.convolve(full, kernel, mode='same')
+        return filtered[-len(data):]
+
+
 class CustomUserRulePlaceholder(BaseProcessingRule):
     """
-    ================================================================================
     【预留开发位置】用户自定义数据处理规则 (User Custom Rule Slot)
-    在此处添加您的具体处理规则，如：
-      - 光谱响应修正 / 照度换算系数 (Lux = Voltage * K + B)
-      - 基线漂移消除 / 移动平均滤波 (Baseline wander removal / Moving average)
-      - 50Hz/60Hz 工频陷波或带通滤波 (Notch / Bandpass filter)
-      - 异常脉冲剔除 (Glitch / Outlier rejection)
-      - 多项式非线性校准 (Polynomial calibration)
-    ================================================================================
+    在此处可随时添加您的个性化算法逻辑，例如增益放大、偏置校准等。
     """
-    def __init__(self, name: str = "CustomRuleSlot", enabled: bool = False, **kwargs):
+    def __init__(self, name: str = "UserRuleSlot", enabled: bool = False, **kwargs):
         super().__init__(name, enabled)
         self.params = kwargs
 
@@ -75,20 +218,16 @@ class CustomUserRulePlaceholder(BaseProcessingRule):
             return data
 
         processed_data = data.copy()
-
-        # >>>>>> [在此编写您的自定义算法规则逻辑] <<<<<<
-        # 示例：
+        # 自定义处理逻辑：
         # gain = self.params.get('gain', 1.0)
         # offset = self.params.get('offset', 0.0)
         # processed_data = processed_data * gain + offset
-
         return processed_data
 
 
 class DataProcessingEngine:
     """
-    The orchestrator pipeline that runs raw acquisition data through registered rules
-    before feeding it into flicker or spectrum algorithms.
+    数据处理引擎中心调度管线：管理并按序执行所有已注册的数据处理与滤波规则。
     """
     def __init__(self):
         self.rules: List[BaseProcessingRule] = []
@@ -99,8 +238,19 @@ class DataProcessingEngine:
         self.rules.append(PassThroughRule(name="PassThrough", enabled=True))
         # 2. 负值截断规则（光学频闪要求非负）
         self.rules.append(ZeroClipRule(name="ZeroClip", enabled=True, min_value=0.0))
-        # 3. 预留用户规则槽位（默认不启用，待用户填入逻辑后随时开启）
+        # 3. 硬件毛刺/尖峰脉冲剔除规则（专门滤除图片中底部的瞬态下冲毛刺）
+        self.rules.append(SpikeGlitchRemovalRule(name="SpikeGlitchFilter", enabled=True, threshold_volts=0.10, window_size=5))
+        # 4. 20kHz 连续流式低通滤波规则（滤除高频底噪）
+        self.rules.append(IIRLowPassFilterRule(name="LowPassFilter", enabled=False, cutoff_hz=20000.0, order=2))
+        # 5. 滑动均值平滑滤波规则
+        self.rules.append(MovingAverageFilterRule(name="MovingAverage", enabled=False, window_size=5))
+        # 6. 预留用户规则槽位
         self.rules.append(CustomUserRulePlaceholder(name="UserRuleSlot", enabled=False))
+
+    def reset_all_filters(self):
+        """Reset state across all streaming filter rules."""
+        for r in self.rules:
+            r.reset()
 
     def add_rule(self, rule: BaseProcessingRule, index: Optional[int] = None):
         """Append or insert a new processing rule."""

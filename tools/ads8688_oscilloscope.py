@@ -21,7 +21,7 @@ import serial.tools.list_ports
 from PyQt6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
-from algorithm import DataProcessingEngine, FlickerCore, FlickerResult
+from algorithm import DataProcessingEngine, FlickerCore, FlickerResult, FlickerPdfReportGenerator
 
 # Configure PyQtGraph performance options
 pg.setConfigOptions(antialias=False, useOpenGL=True)
@@ -35,7 +35,7 @@ FOOTER_FORMAT = "<HH"    # uint16 checksum, uint16 magic_tail
 FOOTER_SIZE = struct.calcsize(FOOTER_FORMAT)
 
 SAMPLING_RATE_DEFAULT = 220000  # 220 kSPS
-BUFFER_CAPACITY = 220000 * 5    # Store up to 5 seconds of full-speed history (1.1M samples)
+BUFFER_CAPACITY = 220000 * 11   # Store up to 11 seconds of full-speed history (~2.42M samples, supports <=10s display)
 
 
 class FastSerialWorker(QtCore.QThread):
@@ -250,6 +250,11 @@ class OscilloscopeWindow(QtWidgets.QMainWindow):
             QPushButton:checked { background-color: #3182ce; border-color: #63b3ed; }
             QComboBox, QSpinBox, QDoubleSpinBox { background-color: #1a202c; border: 1px solid #3c4866; border-radius: 4px; padding: 4px; }
             QLabel { font-size: 12px; }
+            QMessageBox { background-color: #1e2433; border: 1px solid #4a5568; }
+            QMessageBox QLabel { color: #f7fafc; font-size: 13px; font-weight: normal; }
+            QMessageBox QPushButton { background-color: #3182ce; color: #ffffff; min-width: 75px; min-height: 26px; border-radius: 4px; font-weight: bold; }
+            QMessageBox QPushButton:hover { background-color: #4299e1; }
+            QMessageBox QPushButton:pressed { background-color: #2b6cb0; }
         """)
 
         central_widget = QtWidgets.QWidget()
@@ -329,13 +334,22 @@ class OscilloscopeWindow(QtWidgets.QMainWindow):
         self.btn_run_stop.clicked.connect(self.toggle_run_stop)
         ctrl_layout.addWidget(self.btn_run_stop, 0, 0, 1, 2)
 
-        ctrl_layout.addWidget(QtWidgets.QLabel("Time Window (ms):"), 1, 0)
+        ctrl_layout.addWidget(QtWidgets.QLabel("Time Window:"), 1, 0)
+        time_input_box = QtWidgets.QHBoxLayout()
         self.spin_timebase = QtWidgets.QDoubleSpinBox()
-        self.spin_timebase.setRange(0.5, 2000.0)
+        self.spin_timebase.setRange(0.5, 10000.0)  # 最大不超过 10 秒 (10000 ms)
         self.spin_timebase.setValue(10.0)
+        self.spin_timebase.setSuffix(" ms")
+        self.spin_timebase.setDecimals(1)
         self.spin_timebase.setSingleStep(5.0)
         self.spin_timebase.valueChanged.connect(self._on_timebase_changed)
-        ctrl_layout.addWidget(self.spin_timebase, 1, 1)
+        time_input_box.addWidget(self.spin_timebase, stretch=3)
+
+        self.combo_timebase_quick = QtWidgets.QComboBox()
+        self.combo_timebase_quick.addItems(["快捷预设", "1 ms", "5 ms", "10 ms", "20 ms", "50 ms", "100 ms", "500 ms", "1.0 s", "2.0 s", "5.0 s", "10.0 s"])
+        self.combo_timebase_quick.currentIndexChanged.connect(self._on_timebase_preset_changed)
+        time_input_box.addWidget(self.combo_timebase_quick, stretch=2)
+        ctrl_layout.addLayout(time_input_box, 1, 1)
 
         ctrl_layout.addWidget(QtWidgets.QLabel("Scale Calib:"), 2, 0)
         self.scale_combo = QtWidgets.QComboBox()
@@ -351,6 +365,22 @@ class OscilloscopeWindow(QtWidgets.QMainWindow):
         self.chk_zeroclip.setChecked(True)
         self.chk_zeroclip.toggled.connect(lambda v: self.data_engine.set_rule_enabled("ZeroClip", v))
         engine_layout.addWidget(self.chk_zeroclip)
+
+        self.chk_spike_filter = QtWidgets.QCheckBox("启用脉冲毛刺剔除 (Anti-Glitch)")
+        self.chk_spike_filter.setChecked(True)
+        self.chk_spike_filter.setToolTip("消除由于地弹、USB传输瞬态或硬件噪声导致的突变下冲尖峰毛刺")
+        self.chk_spike_filter.toggled.connect(lambda v: self.data_engine.set_rule_enabled("SpikeGlitchFilter", v))
+        engine_layout.addWidget(self.chk_spike_filter)
+
+        self.chk_lowpass = QtWidgets.QCheckBox("启用低通降噪 (LowPass 20kHz)")
+        self.chk_lowpass.setChecked(False)
+        self.chk_lowpass.toggled.connect(lambda v: self.data_engine.set_rule_enabled("LowPassFilter", v))
+        engine_layout.addWidget(self.chk_lowpass)
+
+        self.chk_moving_avg = QtWidgets.QCheckBox("启用滑动均值滤波 (MovingAvg)")
+        self.chk_moving_avg.setChecked(False)
+        self.chk_moving_avg.toggled.connect(lambda v: self.data_engine.set_rule_enabled("MovingAverage", v))
+        engine_layout.addWidget(self.chk_moving_avg)
 
         self.chk_custom_rule = QtWidgets.QCheckBox("启用预留开发规则 (UserCustomSlot)")
         self.chk_custom_rule.setChecked(False)
@@ -435,7 +465,7 @@ class OscilloscopeWindow(QtWidgets.QMainWindow):
         top_bar = QtWidgets.QHBoxLayout()
         top_bar.addWidget(QtWidgets.QLabel("<b>采集时长 (Capture Duration):</b>"))
         self.combo_flicker_dur = QtWidgets.QComboBox()
-        self.combo_flicker_dur.addItems(["1.0 秒 (快速评估)", "2.0 秒 (推荐准度)", "5.0 秒 (深度测量)"])
+        self.combo_flicker_dur.addItems(["1.0 秒 (快速评估)", "2.0 秒 (推荐准度)", "5.0 秒 (深度测量)", "10.0 秒 (长时完整测量)"])
         self.combo_flicker_dur.setCurrentIndex(0)
         top_bar.addWidget(self.combo_flicker_dur)
 
@@ -444,9 +474,14 @@ class OscilloscopeWindow(QtWidgets.QMainWindow):
         self.btn_run_flicker.clicked.connect(self.start_flicker_analysis)
         top_bar.addWidget(self.btn_run_flicker)
 
-        self.btn_export_flicker = QtWidgets.QPushButton("📄 导出频闪报告 (Export CSV)")
-        self.btn_export_flicker.clicked.connect(self.export_flicker_report)
-        top_bar.addWidget(self.btn_export_flicker)
+        self.btn_export_flicker_pdf = QtWidgets.QPushButton("📄 导出PDF认证报告 (Export PDF)")
+        self.btn_export_flicker_pdf.setStyleSheet("background-color: #2b6cb0; color: white;")
+        self.btn_export_flicker_pdf.clicked.connect(self.export_flicker_pdf)
+        top_bar.addWidget(self.btn_export_flicker_pdf)
+
+        self.btn_export_flicker_csv = QtWidgets.QPushButton("📊 导出CSV数据")
+        self.btn_export_flicker_csv.clicked.connect(self.export_flicker_report)
+        top_bar.addWidget(self.btn_export_flicker_csv)
 
         # Progress bar for live capture countdown
         self.progress_flicker = QtWidgets.QProgressBar()
@@ -609,6 +644,37 @@ class OscilloscopeWindow(QtWidgets.QMainWindow):
 
     def _on_timebase_changed(self, val):
         self.timebase_ms = val
+        if val >= 1000.0:
+            self.plot_widget.setLabel('bottom', "Time", units='s')
+        else:
+            self.plot_widget.setLabel('bottom', "Time", units='ms')
+        # Adjust X-axis range to match the selected time window
+        x_max = (val / 1000.0) if val >= 1000.0 else val
+        self.plot_widget.setXRange(0, x_max, padding=0.02)
+
+    def _on_timebase_preset_changed(self, idx):
+        if idx == 0:
+            return
+        text = self.combo_timebase_quick.currentText()
+        preset_map = {
+            "1 ms": 1.0,
+            "5 ms": 5.0,
+            "10 ms": 10.0,
+            "20 ms": 20.0,
+            "50 ms": 50.0,
+            "100 ms": 100.0,
+            "500 ms": 500.0,
+            "1.0 s": 1000.0,
+            "2.0 s": 2000.0,
+            "5.0 s": 5000.0,
+            "10.0 s": 10000.0,
+        }
+        if text in preset_map:
+            self.spin_timebase.setValue(preset_map[text])
+        # Reset preset combo to placeholder
+        self.combo_timebase_quick.blockSignals(True)
+        self.combo_timebase_quick.setCurrentIndex(0)
+        self.combo_timebase_quick.blockSignals(False)
 
     def _on_scale_changed(self, idx):
         self.voltage_scale_mode = self.scale_combo.currentText()
@@ -752,13 +818,14 @@ class OscilloscopeWindow(QtWidgets.QMainWindow):
 
         # Intelligent decimation for high point counts
         num_pts = len(disp_data)
+        t_max = (self.timebase_ms / 1000.0) if self.timebase_ms >= 1000.0 else self.timebase_ms
         if num_pts > 10000:
             step = int(np.ceil(num_pts / 10000))
             render_y = disp_data[::step]
-            time_axis = np.linspace(0, self.timebase_ms, len(render_y), endpoint=False)
+            time_axis = np.linspace(0, t_max, len(render_y), endpoint=False)
             self.curve.setData(time_axis, render_y)
         else:
-            time_axis = np.linspace(0, self.timebase_ms, num_pts, endpoint=False)
+            time_axis = np.linspace(0, t_max, num_pts, endpoint=False)
             self.curve.setData(time_axis, disp_data)
 
         # Real-time Measurements
@@ -831,8 +898,10 @@ class OscilloscopeWindow(QtWidgets.QMainWindow):
             duration = 1.0
         elif "2.0" in dur_str:
             duration = 2.0
-        else:
+        elif "5.0" in dur_str:
             duration = 5.0
+        else:
+            duration = 10.0
 
         self.flicker_target_duration = duration
         self.flicker_target_samples = int(duration * self.sample_rate)
@@ -910,6 +979,28 @@ class OscilloscopeWindow(QtWidgets.QMainWindow):
         self.lbl_flicker_status.setStyleSheet("color: #f56565; font-weight: bold;")
         QtWidgets.QMessageBox.critical(self, "频闪计算异常", f"分析失败: {err_msg}")
 
+    def export_flicker_pdf(self):
+        """Export publication-quality optical flicker compliance report as PDF."""
+        if self.last_flicker_result is None or self.last_flicker_data is None:
+            QtWidgets.QMessageBox.information(self, "提示", "请先执行一次频闪分析再导出PDF报告！")
+            return
+
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "导出频闪认证PDF报告", "flicker_compliance_report.pdf", "PDF Files (*.pdf)"
+        )
+        if not path:
+            return
+
+        try:
+            FlickerPdfReportGenerator.generate_pdf(
+                path, self.last_flicker_result, self.sample_rate
+            )
+            QtWidgets.QMessageBox.information(
+                self, "导出成功", f"频闪认证PDF报告已成功生成并保存至:\n{path}"
+            )
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "导出错误", f"生成PDF报告失败: {e}")
+
     def export_flicker_report(self):
         """Export comprehensive flicker compliance results to CSV report."""
         if self.last_flicker_result is None or self.last_flicker_data is None:
@@ -924,8 +1015,8 @@ class OscilloscopeWindow(QtWidgets.QMainWindow):
 
         res = self.last_flicker_result
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write("# ADS8688 光学频闪测试与认证评估报告\n")
+            with open(path, "w", encoding="utf-8-sig") as f:
+                f.write("# 光学频闪测试与认证评估报告\n")
                 f.write(f"# 测试时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write(f"# 采样率: {self.sample_rate} Hz, 时长: {res.duration_sec} s, 点数: {res.sample_count}\n\n")
                 f.write("指标类别,项目名称,测量结果,合格建议阈值\n")
@@ -969,6 +1060,22 @@ class OscilloscopeWindow(QtWidgets.QMainWindow):
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
+    app.setStyle("Fusion")
+    dark_palette = QtGui.QPalette()
+    dark_palette.setColor(QtGui.QPalette.ColorRole.Window, QtGui.QColor("#1e2433"))
+    dark_palette.setColor(QtGui.QPalette.ColorRole.WindowText, QtGui.QColor("#f7fafc"))
+    dark_palette.setColor(QtGui.QPalette.ColorRole.Base, QtGui.QColor("#16181d"))
+    dark_palette.setColor(QtGui.QPalette.ColorRole.AlternateBase, QtGui.QColor("#1e2433"))
+    dark_palette.setColor(QtGui.QPalette.ColorRole.ToolTipBase, QtGui.QColor("#f7fafc"))
+    dark_palette.setColor(QtGui.QPalette.ColorRole.ToolTipText, QtGui.QColor("#f7fafc"))
+    dark_palette.setColor(QtGui.QPalette.ColorRole.Text, QtGui.QColor("#f7fafc"))
+    dark_palette.setColor(QtGui.QPalette.ColorRole.Button, QtGui.QColor("#2b354b"))
+    dark_palette.setColor(QtGui.QPalette.ColorRole.ButtonText, QtGui.QColor("#f7fafc"))
+    dark_palette.setColor(QtGui.QPalette.ColorRole.BrightText, QtGui.QColor("#ff0000"))
+    dark_palette.setColor(QtGui.QPalette.ColorRole.Highlight, QtGui.QColor("#3182ce"))
+    dark_palette.setColor(QtGui.QPalette.ColorRole.HighlightedText, QtGui.QColor("#ffffff"))
+    app.setPalette(dark_palette)
+
     window = OscilloscopeWindow()
     window.show()
     sys.exit(app.exec())
